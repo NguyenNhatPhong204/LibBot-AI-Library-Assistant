@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gọi LibBot - Bàn {{ table_id }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-slate-100 min-h-screen flex items-center justify-center px-4">
+    <div class="bg-white w-full max-w-md rounded-3xl shadow-xl p-6 text-center">
+        <div class="text-sm text-slate-500 mb-2">
+            Thư viện thông minh
+        </div>
+
+        <h1 class="text-3xl font-bold text-slate-800 mb-2">
+            LibBot
+        </h1>
+
+        <p class="text-slate-600 mb-6">
+            Bạn đang ở <span class="font-semibold">bàn số {{ table_id }}</span>.
+        </p>
+
+        <button
+            id="callBtn"
+            data-table-id="{{ table_id }}"
+            class="w-full bg-slate-900 text-white py-4 rounded-2xl text-lg font-semibold active:scale-[0.98] transition disabled:opacity-60">
+            Gọi LibBot đến bàn này
+        </button>
+
+        <button
+            id="stopBtn"
+            class="w-full mt-3 bg-red-600 text-white py-3 rounded-2xl text-base font-semibold active:scale-[0.98] transition disabled:opacity-60">
+            Dừng khẩn cấp
+        </button>
+
+        <div id="statusBox" class="mt-5 text-sm text-slate-600 min-h-[48px]">
+            Trạng thái: sẵn sàng.
+        </div>
+    </div>
+
+    <script src="/static/table_call.js"></script>
+</body>
+</html>

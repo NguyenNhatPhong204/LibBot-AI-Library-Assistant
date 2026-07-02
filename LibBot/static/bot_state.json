@@ -1,0 +1,9 @@
+{
+  "mode": "speaking",
+  "robot_status": "speaking",
+  "target_table": 1,
+  "current_stop": 1,
+  "last_event": "test_speaking",
+  "updated_at": "",
+  "messages": []
+}

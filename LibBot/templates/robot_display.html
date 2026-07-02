@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=1024, height=600, initial-scale=1.0, user-scalable=no">
+    <title>LibBot AI Companion Face</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background: #f8fafc;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+
+        #faceCanvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            background:
+                radial-gradient(circle at 50% 42%, rgba(59, 130, 246, 0.10), transparent 28%),
+                radial-gradient(circle at 50% 50%, rgba(14, 165, 233, 0.07), transparent 46%),
+                linear-gradient(180deg, #ffffff 0%, #f8fafc 58%, #eef2f7 100%);
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="faceCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById("faceCanvas");
+        const ctx = canvas.getContext("2d");
+
+        let faceState = "idle";
+        let previousFaceState = "idle";
+        let transitionStart = performance.now();
+
+        const FACE_STATES = {
+            IDLE: "idle",
+            LISTENING: "listening",
+            THINKING: "thinking",
+            SPEAKING: "speaking"
+        };
+
+        const state = {
+            centerX: 0,
+            centerY: 0,
+
+            leftX: 0,
+            rightX: 0,
+            eyeY: 0,
+
+            baseEyeWidth: 108,
+            baseEyeHeight: 258,
+            eyeRadius: 58,
+            eyeGap: 250,
+
+            offsetX: 0,
+            offsetY: 0,
+            targetOffsetX: 0,
+            targetOffsetY: 0,
+
+            blink: 1,
+            targetBlink: 1,
+
+            eyeWidthScale: 1,
+            targetEyeWidthScale: 1,
+
+            eyeHeightScale: 1,
+            targetEyeHeightScale: 1,
+
+            glow: 1,
+            targetGlow: 1,
+
+            mouthOpen: 0,
+            targetMouthOpen: 0,
+
+            auraRotation: 0,
+            wavePhase: 0,
+            time: 0,
+
+            particles: []
+        };
+
+        function resizeCanvas() {
+            const dpr = window.devicePixelRatio || 1;
+
+            canvas.width = Math.floor(window.innerWidth * dpr);
+            canvas.height = Math.floor(window.innerHeight * dpr);
+
+            ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            state.centerX = w / 2;
+            state.centerY = h / 2 - 4;
+
+            state.eyeGap = Math.min(w * 0.245, 260);
+            state.leftX = state.centerX - state.eyeGap / 2;
+            state.rightX = state.centerX + state.eyeGap / 2;
+            state.eyeY = state.centerY - 6;
+
+            state.baseEyeWidth = Math.min(w * 0.105, 112);
+            state.baseEyeHeight = Math.min(h * 0.455, 286);
+            state.eyeRadius = state.baseEyeWidth * 0.56;
+
+            initParticles();
+        }
+
+        function initParticles() {
+            state.particles = [];
+
+            const count = 22;
+            for (let i = 0; i < count; i++) {
+                state.particles.push({
+                    angle: Math.random() * Math.PI * 2,
+                    radius: 120 + Math.random() * 150,
+                    speed: 0.08 + Math.random() * 0.16,
+                    size: 1.2 + Math.random() * 2.2,
+                    alpha: 0.08 + Math.random() * 0.13,
+                    drift: Math.random() * Math.PI * 2
+                });
+            }
+        }
+
+        function lerp(a, b, t) {
+            return a + (b - a) * t;
+        }
+
+        function easeInOut(t) {
+            return t < 0.5
+                ? 4 * t * t * t
+                : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        function clamp(value, min, max) {
+            return Math.max(min, Math.min(max, value));
+        }
+
+        function roundRect(ctx, x, y, w, h, r) {
+            const radius = Math.min(r, w / 2, h / 2);
+
+            ctx.beginPath();
+            ctx.moveTo(x + radius, y);
+            ctx.lineTo(x + w - radius, y);
+            ctx.quadraticCurveTo(x + w, y, x + w, y + radius);
+            ctx.lineTo(x + w, y + h - radius);
+            ctx.quadraticCurveTo(x + w, y + h, x + w - radius, y + h);
+            ctx.lineTo(x + radius, y + h);
+            ctx.quadraticCurveTo(x, y + h, x, y + h - radius);
+            ctx.lineTo(x, y + radius);
+            ctx.quadraticCurveTo(x, y, x + radius, y);
+            ctx.closePath();
+        }
+
+        function setFaceState(nextState) {
+            if (faceState === nextState) return;
+
+            previousFaceState = faceState;
+            faceState = nextState;
+            transitionStart = performance.now();
+        }
+
+        function getPalette() {
+            if (faceState === FACE_STATES.LISTENING) {
+                return {
+                    primary: "#2563eb",
+                    secondary: "#60a5fa",
+                    soft: "rgba(37, 99, 235, 0.16)",
+                    glow: "rgba(37, 99, 235, 0.34)",
+                    shadow: "rgba(37, 99, 235, 0.18)",
+                    dark: "#1e3a8a"
+                };
+            }
+
+            if (faceState === FACE_STATES.THINKING) {
+                return {
+                    primary: "#0891b2",
+                    secondary: "#67e8f9",
+                    soft: "rgba(8, 145, 178, 0.14)",
+                    glow: "rgba(8, 145, 178, 0.32)",
+                    shadow: "rgba(8, 145, 178, 0.16)",
+                    dark: "#155e75"
+                };
+            }
+
+            if (faceState === FACE_STATES.SPEAKING) {
+                return {
+                    primary: "#0f766e",
+                    secondary: "#5eead4",
+                    soft: "rgba(15, 118, 110, 0.15)",
+                    glow: "rgba(15, 118, 110, 0.34)",
+                    shadow: "rgba(15, 118, 110, 0.18)",
+                    dark: "#134e4a"
+                };
+            }
+
+            return {
+                primary: "#111827",
+                secondary: "#334155",
+                soft: "rgba(15, 23, 42, 0.08)",
+                glow: "rgba(15, 23, 42, 0.18)",
+                shadow: "rgba(15, 23, 42, 0.10)",
+                dark: "#020617"
+            };
+        }
+
+        function updateTargets() {
+            const t = performance.now() / 1000;
+            state.time = t;
+
+            if (faceState === FACE_STATES.IDLE) {
+                state.targetOffsetX = Math.sin(t * 0.72) * 18;
+                state.targetOffsetY = Math.sin(t * 0.52) * 3;
+                state.targetBlink = 1;
+                state.targetEyeWidthScale = 1.00;
+                state.targetEyeHeightScale = 1.00;
+                state.targetGlow = 0.95;
+                state.targetMouthOpen = 0;
+
+                const blinkSignal = Math.sin(t * 1.06);
+                if (blinkSignal > 0.992) {
+                    state.targetBlink = 0.055;
+                }
+            }
+
+            else if (faceState === FACE_STATES.LISTENING) {
+                state.targetOffsetX = Math.sin(t * 0.95) * 7;
+                state.targetOffsetY = -5 + Math.sin(t * 0.85) * 2;
+                state.targetBlink = 1;
+                state.targetEyeWidthScale = 1.06;
+                state.targetEyeHeightScale = 1.08;
+                state.targetGlow = 1.18;
+                state.targetMouthOpen = 0;
+
+                const microBlink = Math.sin(t * 1.85);
+                if (microBlink > 0.997) {
+                    state.targetBlink = 0.22;
+                }
+            }
+
+            else if (faceState === FACE_STATES.THINKING) {
+                state.targetOffsetX = Math.sin(t * 1.9) * 34;
+                state.targetOffsetY = Math.sin(t * 1.25) * 6;
+                state.targetBlink = 0.78 + Math.sin(t * 2.6) * 0.05;
+                state.targetEyeWidthScale = 0.98;
+                state.targetEyeHeightScale = 0.84;
+                state.targetGlow = 1.20;
+                state.targetMouthOpen = 0;
+            }
+
+            else if (faceState === FACE_STATES.SPEAKING) {
+                state.targetOffsetX = Math.sin(t * 1.25) * 8;
+                state.targetOffsetY = Math.sin(t * 0.90) * 3;
+
+                state.targetBlink = 0.88 + Math.sin(t * 9.0) * 0.10;
+
+                state.targetEyeWidthScale = 1.01;
+                state.targetEyeHeightScale = 0.98 + Math.sin(t * 10.5) * 0.055;
+
+                state.targetGlow = 1.28;
+
+                state.targetMouthOpen = 0.55 + Math.sin(t * 10.5) * 0.38;
+            }
+        }
+
+        function smoothState() {
+            state.offsetX = lerp(state.offsetX, state.targetOffsetX, 0.075);
+            state.offsetY = lerp(state.offsetY, state.targetOffsetY, 0.075);
+            state.blink = lerp(state.blink, state.targetBlink, 0.16);
+
+            state.eyeWidthScale = lerp(state.eyeWidthScale, state.targetEyeWidthScale, 0.10);
+            state.eyeHeightScale = lerp(state.eyeHeightScale, state.targetEyeHeightScale, 0.10);
+            state.glow = lerp(state.glow, state.targetGlow, 0.09);
+            state.mouthOpen = lerp(state.mouthOpen, state.targetMouthOpen, 0.20);
+
+            state.auraRotation += 0.0022;
+            state.wavePhase += 0.035;
+        }
+
+        function drawSoftBackground() {
+            const palette = getPalette();
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            ctx.save();
+
+            const centerGlow = ctx.createRadialGradient(
+                state.centerX, state.centerY, 20,
+                state.centerX, state.centerY, Math.min(w, h) * 0.55
+            );
+
+            centerGlow.addColorStop(0, palette.soft);
+            centerGlow.addColorStop(0.45, "rgba(255,255,255,0.0)");
+            centerGlow.addColorStop(1, "rgba(255,255,255,0.0)");
+
+            ctx.fillStyle = centerGlow;
+            ctx.fillRect(0, 0, w, h);
+
+            const floorGlow = ctx.createRadialGradient(
+                state.centerX, h * 0.82, 10,
+                state.centerX, h * 0.82, w * 0.55
+            );
+            floorGlow.addColorStop(0, "rgba(148, 163, 184, 0.12)");
+            floorGlow.addColorStop(0.55, "rgba(148, 163, 184, 0.04)");
+            floorGlow.addColorStop(1, "rgba(255,255,255,0)");
+
+            ctx.fillStyle = floorGlow;
+            ctx.fillRect(0, 0, w, h);
+
+            ctx.restore();
+        }
+
+        function drawCompanionHalo() {
+            const palette = getPalette();
+
+            ctx.save();
+            ctx.translate(state.centerX, state.centerY);
+            ctx.rotate(state.auraRotation);
+
+            const radiusBase = Math.min(window.innerHeight * 0.31, 190);
+
+            ctx.strokeStyle = palette.glow;
+            ctx.lineWidth = 2.5;
+
+            for (let i = 0; i < 3; i++) {
+                const r = radiusBase + i * 26;
+                const alpha = 0.18 - i * 0.045;
+
+                ctx.strokeStyle = palette.glow.replace(/0\.\d+\)/, `${alpha})`);
+
+                ctx.beginPath();
+                ctx.arc(0, 0, r, Math.PI * 0.12, Math.PI * 0.42);
+                ctx.stroke();
+
+                ctx.beginPath();
+                ctx.arc(0, 0, r, Math.PI * 1.12, Math.PI * 1.42);
+                ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+
+        function drawParticles() {
+            const palette = getPalette();
+            const intensity = faceState === FACE_STATES.IDLE ? 0.55 : 1.0;
+
+            ctx.save();
+
+            for (const p of state.particles) {
+                p.angle += p.speed * 0.004 * (faceState === FACE_STATES.THINKING ? 2.2 : 1.0);
+
+                const wave = Math.sin(state.time * 0.7 + p.drift) * 10;
+                const x = state.centerX + Math.cos(p.angle) * (p.radius + wave);
+                const y = state.centerY + Math.sin(p.angle) * (p.radius * 0.52 + wave);
+
+                ctx.fillStyle = palette.glow.replace(/0\.\d+\)/, `${p.alpha * intensity})`);
+                ctx.beginPath();
+                ctx.arc(x, y, p.size, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.restore();
+        }
+
+        function drawEyeShape(x, y, width, height, radius, palette) {
+            ctx.save();
+
+            ctx.shadowColor = palette.glow;
+            ctx.shadowBlur = 42 * state.glow;
+            ctx.shadowOffsetY = 4;
+
+            const gradient = ctx.createLinearGradient(x, y - height / 2, x, y + height / 2);
+            gradient.addColorStop(0, "#ffffff");
+            gradient.addColorStop(0.11, palette.secondary);
+            gradient.addColorStop(0.42, palette.primary);
+            gradient.addColorStop(0.78, palette.primary);
+            gradient.addColorStop(1, palette.dark);
+
+            ctx.fillStyle = gradient;
+
+            roundRect(
+                ctx,
+                x - width / 2,
+                y - height / 2,
+                width,
+                height,
+                radius
+            );
+
+            ctx.fill();
+
+            ctx.shadowBlur = 0;
+
+            // glossy highlight
+            const highlightGradient = ctx.createLinearGradient(x, y - height / 2, x, y);
+            highlightGradient.addColorStop(0, "rgba(255,255,255,0.46)");
+            highlightGradient.addColorStop(1, "rgba(255,255,255,0.02)");
+
+            ctx.fillStyle = highlightGradient;
+            roundRect(
+                ctx,
+                x - width * 0.32,
+                y - height * 0.42,
+                width * 0.22,
+                height * 0.62,
+                width * 0.10
+            );
+            ctx.fill();
+
+            // soft lower reflection
+            ctx.fillStyle = "rgba(255,255,255,0.10)";
+            roundRect(
+                ctx,
+                x + width * 0.18,
+                y + height * 0.10,
+                width * 0.16,
+                height * 0.28,
+                width * 0.08
+            );
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        function drawEyeShadow(x, y, width, height) {
+            ctx.save();
+
+            const shadow = ctx.createRadialGradient(
+                x, y + height * 0.48, 1,
+                x, y + height * 0.48, width * 1.35
+            );
+            shadow.addColorStop(0, "rgba(15, 23, 42, 0.12)");
+            shadow.addColorStop(1, "rgba(15, 23, 42, 0)");
+
+            ctx.fillStyle = shadow;
+            ctx.beginPath();
+            ctx.ellipse(x, y + height * 0.54, width * 0.95, height * 0.10, 0, 0, Math.PI * 2);
+            ctx.fill();
+
+            ctx.restore();
+        }
+
+        function drawListeningRing() {
+            if (faceState !== FACE_STATES.LISTENING) return;
+
+            const palette = getPalette();
+            const pulse = (Math.sin(state.time * 3.2) + 1) / 2;
+
+            ctx.save();
+
+            ctx.strokeStyle = palette.glow.replace(/0\.\d+\)/, `${0.12 + pulse * 0.13})`);
+            ctx.lineWidth = 4;
+
+            ctx.beginPath();
+            ctx.ellipse(
+                state.centerX,
+                state.centerY,
+                190 + pulse * 18,
+                135 + pulse * 10,
+                0,
+                0,
+                Math.PI * 2
+            );
+            ctx.stroke();
+
+            ctx.restore();
+        }
+
+        function drawThinkingOrbit() {
+            if (faceState !== FACE_STATES.THINKING) return;
+
+            const palette = getPalette();
+
+            ctx.save();
+            ctx.translate(state.centerX, state.centerY);
+            ctx.rotate(-state.auraRotation * 2.2);
+
+            ctx.lineCap = "round";
+            ctx.lineWidth = 6;
+
+            const r = 178;
+
+            for (let i = 0; i < 10; i++) {
+                const start = i * (Math.PI * 2 / 10) + Math.sin(state.time * 2 + i) * 0.04;
+                const length = 0.18 + Math.sin(state.time * 2.5 + i) * 0.035;
+
+                ctx.strokeStyle = palette.glow.replace(/0\.\d+\)/, `${0.12 + i * 0.006})`);
+
+                ctx.beginPath();
+                ctx.arc(0, 0, r, start, start + length);
+                ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+
+        function drawSpeakingMouth() {
+            if (faceState !== FACE_STATES.SPEAKING) return;
+
+            const palette = getPalette();
+
+            const mouthCenterX = state.centerX;
+            const mouthCenterY = state.centerY + state.baseEyeHeight * 0.42;
+
+            const pulse = (Math.sin(state.time * 10.0) + 1) / 2;
+
+            ctx.save();
+
+            const barCount = 7;
+            const barGap = 9;
+            const barWidth = 7;
+            const maxBarHeight = 34;
+            const totalWidth = (barCount - 1) * barGap + barWidth;
+
+            ctx.shadowColor = palette.glow;
+            ctx.shadowBlur = 18;
+            ctx.fillStyle = palette.primary;
+
+            for (let i = 0; i < barCount; i++) {
+                const phase = state.time * 9.0 + i * 0.72;
+                const amp = (Math.sin(phase) + 1) / 2;
+
+                const barHeight = 10 + amp * maxBarHeight * state.mouthOpen;
+                const x = mouthCenterX - totalWidth / 2 + i * barGap;
+                const y = mouthCenterY - barHeight / 2;
+
+                roundRect(
+                    ctx,
+                    x,
+                    y,
+                    barWidth,
+                    barHeight,
+                    barWidth / 2
+                );
+                ctx.fill();
+            }
+
+            ctx.restore();
+        }
+
+        function drawFace() {
+            const w = window.innerWidth;
+            const h = window.innerHeight;
+
+            ctx.clearRect(0, 0, w, h);
+
+            updateTargets();
+            smoothState();
+
+            const palette = getPalette();
+
+            drawSoftBackground();
+            drawCompanionHalo();
+            drawParticles();
+            drawListeningRing();
+            drawThinkingOrbit();
+
+            let eyeWidth = state.baseEyeWidth * state.eyeWidthScale;
+            let eyeHeight = state.baseEyeHeight * state.eyeHeightScale * state.blink;
+            eyeHeight = Math.max(12, eyeHeight);
+
+            const eyeY = state.eyeY + state.offsetY;
+            const leftX = state.leftX + state.offsetX;
+            const rightX = state.rightX + state.offsetX;
+
+            drawEyeShadow(leftX, eyeY, eyeWidth, eyeHeight);
+            drawEyeShadow(rightX, eyeY, eyeWidth, eyeHeight);
+
+            drawEyeShape(leftX, eyeY, eyeWidth, eyeHeight, state.eyeRadius, palette);
+            drawEyeShape(rightX, eyeY, eyeWidth, eyeHeight, state.eyeRadius, palette);
+
+            drawSpeakingMouth();
+
+            requestAnimationFrame(drawFace);
+        }
+
+        function normalizeToFaceState(robotStatus) {
+            if (robotStatus === "idle" || robotStatus === "stopped") {
+                return FACE_STATES.IDLE;
+            }
+
+            if (robotStatus === "arrived" || robotStatus === "listening") {
+                return FACE_STATES.LISTENING;
+            }
+
+            if (robotStatus === "speaking") {
+                return FACE_STATES.SPEAKING;
+            }
+
+            return FACE_STATES.THINKING;
+        }
+
+        async function fetchBotState() {
+            try {
+                const response = await fetch("/static/bot_state.json?t=" + Date.now());
+                const data = await response.json();
+
+                const robotStatus = data.robot_status || data.mode || "idle";
+                const nextState = normalizeToFaceState(robotStatus);
+
+                setFaceState(nextState);
+
+            } catch (error) {
+                setFaceState(FACE_STATES.THINKING);
+            }
+        }
+
+        window.addEventListener("resize", resizeCanvas);
+
+        resizeCanvas();
+        fetchBotState();
+        setInterval(fetchBotState, 500);
+        requestAnimationFrame(drawFace);
+    </script>
+</body>
+
+</html>
