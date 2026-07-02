@@ -1,47 +1,62 @@
 /*
-  LibBot - ESP32 Line Following + Stop Point Test
-  HW-871 5 kênh + L298N
+  LibBot - ESP32 Line Following V6 TCP GOTO + RETURN + Raspberry Task
+  Improved Stop Point Detection with Cross Score + Soft Stable Counter
+  Added: GOTO Boost Speed
 
-  Mục tiêu bản test:
-  - Robot tự chạy sau khi cấp nguồn.
-  - Không dùng Serial commands.
-  - Không dùng Wi-Fi/TCP/GOTO/RETURN.
-  - Dò line hình con nhộng.
-  - Có 4 điểm dừng bằng vạch line ngang nằm trên đoạn line thẳng.
-  - Xe dừng tại mỗi vạch ngang 5 giây rồi tự đi tiếp.
+  Hardware:
+  - ESP32
+  - HW-871 5-channel line sensor
+  - L298N motor driver
 
-  Quy ước:
-  OUT1-OUT2 L298N = Motor phải
-  OUT3-OUT4 L298N = Motor trái
+  TCP commands:
+    PING
+    STATUS
+    STOP
+    GOTO:1
+    GOTO:2
+    GOTO:3
+    GOTO:4
+    RETURN
+    CONTINUE
 
-  Cảm biến:
-  S1 = trái ngoài
-  S2 = trái trong
-  S3 = giữa
-  S4 = phải trong
-  S5 = phải ngoài
+  Sensor convention:
+  - S1 = left outer
+  - S2 = left inner
+  - S3 = center
+  - S4 = right inner
+  - S5 = right outer
 
-  Bit sau chuẩn hóa:
-  bit0 = S1 / trái ngoài
-  bit1 = S2 / trái trong
-  bit2 = S3 / giữa
-  bit3 = S4 / phải trong
-  bit4 = S5 / phải ngoài
-  bit = 1 nghĩa là cảm biến thấy line đen
+  Bit convention after normalization:
+  - bit 0 = S1 / left outer
+  - bit 1 = S2 / left inner
+  - bit 2 = S3 / center
+  - bit 3 = S4 / right inner
+  - bit 4 = S5 / right outer
+  - bit = 1 means sensor sees black line
 
-  Thuật toán điểm dừng:
-  - Không bắt buộc rawBits phải đúng 11111.
-  - Dùng crossScore:
+  Stop point logic:
+  - Does not require rawBits == 11111 absolutely.
+  - Uses crossScore:
       11111       => score 5
       >=4 + S3    => score 4
       01110       => score 3
       S1+S3+S5    => score 3
       00111/11100 => score 2
-  - stableCounterCross tăng khi score cao và giảm chậm khi mất tín hiệu.
+  - Stable counter increases when score is high and decreases slowly when signal drops.
 */
 
 #include <Arduino.h>
+#include <WiFi.h>
 #include <math.h>
+
+// =====================================================
+// WIFI CONFIG
+// =====================================================
+const char* WIFI_SSID = "Phong";
+const char* WIFI_PASS = "11111111";
+
+const uint16_t TCP_PORT = 5000;
+WiFiServer server(TCP_PORT);
 
 // =====================================================
 // LINE SENSOR - ADC1 SAFE PINS
@@ -57,10 +72,11 @@
 /*
   false:
   S1 S2 S3 S4 S5
-  trái ngoài ... giữa ... phải ngoài
+  left ... center ... right
 
   true:
-  đảo thứ tự cảm biến nếu bạn lắp module ngược.
+  S5 S4 S3 S2 S1
+  left ... center ... right
 */
 const bool SENSOR_ORDER_REVERSED = false;
 
@@ -84,52 +100,89 @@ const bool SENSOR_ORDER_REVERSED = false;
 #define PWM_CH_L 1
 
 // =====================================================
-// SPEED CONFIG - BẢN TEST DÒ LINE + ĐIỂM DỪNG
+// SPEED CONFIG - FULL FRAME SAFE PROFILE
 // =====================================================
-int BASE_SPEED   = 220;
-int MIN_SPEED    = 100;
-int MAX_SPEED    = 255;
+int BASE_SPEED   = 195;
+int MIN_SPEED    = 155;
+int MAX_SPEED    = 245;
 int SEARCH_SPEED = 170;
 
-// Có tải phía trên: không để bánh trong quá yếu, nếu không xe vào cua sẽ ì/stall.
-int HARD_TURN_INNER_SPEED = 60;
+int HARD_TURN_INNER_SPEED = 95;
 int HARD_TURN_OUTER_SPEED = 250;
 
-// Với L298N + xe có tải, hạn chế quay lùi khi cua vì dễ tụt lực.
-// Biến này vẫn giữ lại để không phá cấu trúc source.
-int PIVOT_REVERSE_SPEED = 100;
+int PIVOT_REVERSE_SPEED = 45;
 int PIVOT_FORWARD_SPEED = 250;
 
 // =====================================================
-// STOP POINT CONFIG
+// ROBOT TASK MODE
+// =====================================================
+enum RobotMode {
+  MODE_IDLE_AT_BASE = 0,
+  MODE_GOING_TO_TABLE = 1,
+  MODE_WAITING_AT_TABLE = 2,
+  MODE_RETURNING_TO_BASE = 3,
+  MODE_STOPPED = 4,
+  MODE_ERROR = 5
+};
+
+RobotMode robotMode = MODE_IDLE_AT_BASE;
+
+int targetStopPoint = 0;
+bool hasActiveTask = false;
+
+String lastCommand = "";
+String lastEvent = "BOOT";
+
+// =====================================================
+// BOOST CONFIG
+// =====================================================
+unsigned long gotoStartTime = 0;
+const unsigned long GOTO_BOOST_MS = 700;
+const int GOTO_BOOST_SPEED = 220;
+
+// =====================================================
+// STOP POINT CONFIG - V6
 // =====================================================
 const int TOTAL_STOP_POINTS = 4;
 
-// Dừng 3 giây tại mỗi vạch ngang.
-const unsigned long STOP_POINT_WAIT_MS = 3000;
+/*
+  Bỏ qua đoạn start sau khi nhận GOTO để tránh đếm nhầm trạm/start.
+*/
+const unsigned long START_IGNORE_MS = 1800;
 
-// Bỏ qua vạch start trong vài giây đầu sau khi bật nguồn.
-const unsigned long START_IGNORE_MS = 3000;
+/*
+  Sau khi phát hiện vạch ngang:
+  - Robot đi thẳng một đoạn để vượt vạch.
+  - 250 ms cuối cho PID bắt line lại sớm.
+*/
+const unsigned long STOP_POINT_BYPASS_MS = 650;
 
-// Sau khi dừng xong, chạy thẳng một đoạn để vượt khỏi vạch ngang.
-const unsigned long STOP_POINT_BYPASS_MS = 800;
-
-// Sau khi phát hiện một vạch ngang, bỏ qua một thời gian để chống đếm trùng.
+/*
+  Sau khi phát hiện vạch ngang, bỏ qua một thời gian để chống đếm trùng.
+*/
 const unsigned long STOP_POINT_IGNORE_MS = 1000;
 
-// Chống đếm trùng theo khoảng cách thời gian tối thiểu giữa 2 lần phát hiện.
+/*
+  Tốc độ vượt vạch ngang.
+*/
+int STOP_POINT_BYPASS_SPEED = 220;
+
+/*
+  V6: stable mềm.
+  Nếu vẫn bỏ sót điểm dừng: giảm về 2.
+  Nếu nhận nhầm cua: tăng lên 4.
+*/
+const int STOP_POINT_STABLE_NEEDED = 3;
+
+/*
+  Chống đếm trùng theo thời gian.
+*/
 const unsigned long STOP_POINT_MIN_INTERVAL_MS = 1000;
 
-// Tốc độ vượt qua vạch ngang sau khi dừng.
-int STOP_POINT_BYPASS_SPEED = 250;
-
-// Khi bắt đầu thấy dấu hiệu vạch ngang, giảm tốc để dễ bắt vạch hơn.
+/*
+  Giảm tốc nhẹ khi bắt đầu thấy dấu hiệu vạch ngang.
+*/
 const int CROSS_APPROACH_SPEED = 120;
-
-// Stable mềm.
-// Nếu vẫn bỏ sót điểm dừng: giảm về 2.
-// Nếu nhận nhầm cua là vạch ngang: tăng lên 4.
-const int STOP_POINT_STABLE_NEEDED = 1;
 
 int stableCounterCross = 0;
 int stopPointCount = 0;
@@ -137,37 +190,32 @@ int currentStopPoint = 0;
 
 unsigned long stopPointIgnoreUntil = 0;
 unsigned long stopPointBypassUntil = 0;
-unsigned long stopPointWaitUntil = 0;
 unsigned long lastStopPointDetectedAt = 0;
 
 enum StopPointEvent {
   STOP_POINT_NONE = 0,
   STOP_POINT_DETECTED = 1,
-  STOP_POINT_WAITING = 2,
-  STOP_POINT_BYPASS = 3,
-  STOP_POINT_CONTINUE = 4
+  STOP_POINT_BYPASS = 2,
+  STOP_POINT_TARGET_REACHED = 3
 };
 
 StopPointEvent lastStopPointEvent = STOP_POINT_NONE;
 
 // =====================================================
-// ROBOT MODE - CHỈ PHỤC VỤ TEST
+// RETURN TO BASE CONFIG
 // =====================================================
-enum RobotMode {
-  MODE_LINE_FOLLOWING = 0,
-  MODE_STOP_WAITING = 1,
-  MODE_STOP_BYPASS = 2,
-  MODE_LINE_LOST = 3
-};
+const unsigned long RETURN_BASE_MIN_RUN_MS = 800;
+const unsigned long BASE_GAP_DETECT_MS = 200;
 
-RobotMode robotMode = MODE_LINE_FOLLOWING;
+unsigned long returnStartedAt = 0;
+unsigned long baseGapLostStartedAt = 0;
 
 // =====================================================
 // PID CONFIG
 // =====================================================
-float Kp = 22.0;
+float Kp = 20.0;
 float Ki = 0.0;
-float Kd = 18.0;
+float Kd = 12.5;
 
 float integral = 0.0;
 float lastError = 0.0;
@@ -218,7 +266,15 @@ const int SCORE_MIN = 0;
 const int SCORE_MAX = 4;
 const int SCORE_THRESHOLD = 1;
 
+// Khi chạy thật nên false.
+// Khi debug nhận vạch ngang, đổi true tạm thời.
 bool DEBUG_MODE = false;
+
+// =====================================================
+// FORWARD DECLARATIONS
+// =====================================================
+void arriveAtBase();
+void startReturnToBase();
 
 // =====================================================
 // MOTOR FUNCTIONS
@@ -254,14 +310,8 @@ void setLeftMotor(int pwm, bool forward) {
 }
 
 void stopMotors() {
-  // Bật HIGH cả 2 chân + đẩy PWM lên max để khóa từ trường động cơ
-  digitalWrite(IN1_R, HIGH);
-  digitalWrite(IN2_R, HIGH);
-  ledcWrite(PWM_CH_R, 255);
-
-  digitalWrite(IN3_L, HIGH);
-  digitalWrite(IN4_L, HIGH);
-  ledcWrite(PWM_CH_L, 255);
+  setRightMotor(0, true);
+  setLeftMotor(0, true);
 }
 
 void driveForwardPWM(int leftPWM, int rightPWM) {
@@ -278,24 +328,14 @@ void driveForwardFixed(int pwm) {
   setRightMotor(pwm, true);
 }
 
-void driveForwardCurvePWM(int leftPWM, int rightPWM) {
-  leftPWM  = constrain(leftPWM,  0, MAX_SPEED);
-  rightPWM = constrain(rightPWM, 0, MAX_SPEED);
-
-  setLeftMotor(leftPWM, true);
-  setRightMotor(rightPWM, true);
-}
-
 void pivotTurnLeft() {
-  // Lùi bánh trái, tiến bánh phải
-  setLeftMotor(PIVOT_REVERSE_SPEED, false); 
+  setLeftMotor(PIVOT_REVERSE_SPEED, false);
   setRightMotor(PIVOT_FORWARD_SPEED, true);
 }
 
 void pivotTurnRight() {
-  // Tiến bánh trái, lùi bánh phải
   setLeftMotor(PIVOT_FORWARD_SPEED, true);
-  setRightMotor(PIVOT_REVERSE_SPEED, false); 
+  setRightMotor(PIVOT_REVERSE_SPEED, false);
 }
 
 // =====================================================
@@ -396,30 +436,44 @@ int countActiveLineSensors(uint8_t bits) {
 }
 
 // =====================================================
-// STOP POINT FUNCTIONS - CROSS SCORE
+// STOP POINT FUNCTIONS - V6 CROSS SCORE
 // =====================================================
 int getCrossLineScore(uint8_t rawBits) {
   bool s1 = rawBits & (1 << 0);  // trái ngoài
+  bool s2 = rawBits & (1 << 1);  // trái trong
+  bool s3 = rawBits & (1 << 2);  // giữa
+  bool s4 = rawBits & (1 << 3);  // phải trong
   bool s5 = rawBits & (1 << 4);  // phải ngoài
 
-  // Tín hiệu mạnh nhất: Quét qua cả 2 biên cùng lúc -> Chắc chắn là vạch ngang
-  if (s1 && s5) {
-    return 5;
-  }
+  int activeCount = countActiveLineSensors(rawBits);
 
-  // Tín hiệu mạnh: Cả 5 mắt đều đen
+  // 5 cảm biến cùng thấy line: chắc chắn là vạch ngang.
   if (rawBits == 0b11111) {
     return 5;
   }
 
-  // Tín hiệu trung bình: 3 mắt giữa đen. 
-  // Rất hiếm khi vào cua mà bị tình trạng này, thường là xe đi ngang qua vạch hẹp
+  // 4/5 cảm biến và có cảm biến giữa: rất có khả năng là vạch ngang.
+  if (activeCount >= 4 && s3) {
+    return 4;
+  }
+
+  // 3 cảm biến giữa cùng thấy line: có thể là vạch ngang hẹp hoặc xe lệch nhẹ.
   if (rawBits == 0b01110) {
     return 3;
   }
 
-  // Các trường hợp khác (01111, 11110, 00111, 11100...) được tính là CUA, trả về 0 để bỏ qua.
-  return 0; 
+  // Hai biên ngoài + giữa. Có thể xảy ra khi xe đi chéo qua vạch ngang.
+  // Chỉ cho score 3, cần stable counter xác nhận.
+  if (s1 && s3 && s5) {
+    return 3;
+  }
+
+  // Một bên rộng + giữa. Có thể là xe đi chéo qua vạch ngang, nhưng chưa đủ chắc.
+  if (rawBits == 0b00111 || rawBits == 0b11100) {
+    return 2;
+  }
+
+  return 0;
 }
 
 bool detectCrossLine(uint8_t rawBits) {
@@ -490,65 +544,65 @@ void resetPIDAfterStopPoint() {
   }
 }
 
-void startStopPointWaiting() {
-  stopMotors();
-
-  robotMode = MODE_STOP_WAITING;
-  stopPointWaitUntil = millis() + STOP_POINT_WAIT_MS;
-
-  lastStopPointEvent = STOP_POINT_WAITING;
-
+void bypassCurrentStopPoint() {
   resetPIDAfterStopPoint();
 
+  unsigned long now = millis();
+
+  stopPointBypassUntil = now + STOP_POINT_BYPASS_MS;
+  stopPointIgnoreUntil = now + STOP_POINT_IGNORE_MS;
+
+  lastStopPointEvent = STOP_POINT_BYPASS;
+  lastEvent = "BYPASS_STOP:" + String(currentStopPoint);
+}
+
+void arriveAtTargetStopPoint() {
+  stopMotors();
+
+  robotMode = MODE_WAITING_AT_TABLE;
+  hasActiveTask = false;
+
+  lastStopPointEvent = STOP_POINT_TARGET_REACHED;
+  lastEvent = "ARRIVED:" + String(currentStopPoint);
+
+  stopPointIgnoreUntil = millis() + STOP_POINT_IGNORE_MS;
+
   if (DEBUG_MODE) {
-    Serial.print("[STOP] count=");
-    Serial.print(stopPointCount);
+    Serial.print("[ARRIVED] target=");
+    Serial.print(targetStopPoint);
     Serial.print(" current=");
     Serial.println(currentStopPoint);
   }
 }
 
-void updateStopPointWaiting() {
-  unsigned long now = millis();
-
-  stopMotors();
-
-  if (now >= stopPointWaitUntil) {
-    robotMode = MODE_STOP_BYPASS;
-
-    stopPointBypassUntil = now + STOP_POINT_BYPASS_MS;
-    stopPointIgnoreUntil = now + STOP_POINT_IGNORE_MS;
-
-    lastStopPointEvent = STOP_POINT_CONTINUE;
-
-    resetPIDAfterStopPoint();
-
-    if (DEBUG_MODE) {
-      Serial.print("[CONTINUE] current=");
-      Serial.println(currentStopPoint);
-    }
+void handleStopPointAction() {
+  if (DEBUG_MODE) {
+    Serial.print("[CROSS DETECTED] count=");
+    Serial.print(stopPointCount);
+    Serial.print(" current=");
+    Serial.print(currentStopPoint);
+    Serial.print(" target=");
+    Serial.print(targetStopPoint);
+    Serial.print(" mode=");
+    Serial.println((int)robotMode);
   }
-}
 
-void updateStopPointBypass() {
-  unsigned long now = millis();
-
-  if (now < stopPointBypassUntil) {
-    driveForwardFixed(STOP_POINT_BYPASS_SPEED);
-
-    if (DEBUG_MODE) {
-      uint8_t rawBits = readRawLineBits();
-      Serial.print("[BYPASS] raw=");
-      printBits(rawBits);
-      Serial.print(" current=");
-      Serial.println(currentStopPoint);
+  if (robotMode == MODE_GOING_TO_TABLE) {
+    if (currentStopPoint == targetStopPoint) {
+      arriveAtTargetStopPoint();
+      return;
     }
 
+    bypassCurrentStopPoint();
     return;
   }
 
-  robotMode = MODE_LINE_FOLLOWING;
-  resetPIDAfterStopPoint();
+  if (robotMode == MODE_RETURNING_TO_BASE) {
+    bypassCurrentStopPoint();
+    return;
+  }
+
+  bypassCurrentStopPoint();
 }
 
 // =====================================================
@@ -568,11 +622,6 @@ void updateLastSeenSide(uint8_t bits) {
   }
 }
 
-/*
-  Giữ đúng logic từ file bạn gửi:
-  - Với hệ đang normalize như file gốc, các hàm trái/phải đang được định nghĩa như dưới.
-  - Nếu xe cua ngược thực tế, đổi SENSOR_ORDER_REVERSED hoặc đảo lại nhóm hàm này.
-*/
 bool isHardLeft(uint8_t bits) {
   return (bits == 0b00001 || bits == 0b00011 || bits == 0b00111);
 }
@@ -653,11 +702,11 @@ bool computeLineError(float &errorOut, uint8_t &bitsOut, uint8_t rawBits) {
       return true;
 
     case 0b00110:
-      errorOut = -3.50; // Tăng từ -2.00 lên -3.50
+      errorOut = -2.00;
       return true;
 
     case 0b01100:
-      errorOut = 3.50;  // Tăng từ 2.00 lên 3.50
+      errorOut = 2.00;
       return true;
 
     case 0b00010:
@@ -747,7 +796,7 @@ void searchLine() {
 }
 
 // =====================================================
-// LINE FOLLOWING PID
+// LINE FOLLOWING PID STEP
 // =====================================================
 void lineFollowStep() {
   float rawError = 0.0;
@@ -756,23 +805,27 @@ void lineFollowStep() {
   uint8_t rawBits = readRawLineBits();
   unsigned long now = millis();
 
-  // Đang dừng 5 giây tại điểm dừng.
-  if (robotMode == MODE_STOP_WAITING) {
-    updateStopPointWaiting();
-    return;
-  }
-
-  // Đang vượt qua vạch ngang sau khi dừng.
-  if (robotMode == MODE_STOP_BYPASS) {
-    updateStopPointBypass();
-    return;
-  }
-
   /*
-    Nếu đang trong giai đoạn bypass cuối:
-    - Giai đoạn đầu của bypass đã return trong MODE_STOP_BYPASS.
-    - Khi hết bypass, PID chạy lại bình thường.
+    Bypass sau vạch ngang:
+    - Giai đoạn đầu: chạy thẳng qua vạch.
+    - 250 ms cuối: cho PID bắt line lại sớm.
   */
+  if (now < stopPointBypassUntil) {
+    unsigned long remain = stopPointBypassUntil - now;
+
+    if (remain > 250) {
+      driveForwardFixed(STOP_POINT_BYPASS_SPEED);
+
+      if (DEBUG_MODE) {
+        Serial.print("[BYPASS] raw=");
+        printBits(rawBits);
+        Serial.print(" current=");
+        Serial.println(currentStopPoint);
+      }
+
+      return;
+    }
+  }
 
   /*
     Giảm tốc nhẹ khi bắt đầu thấy dấu hiệu vạch ngang.
@@ -781,6 +834,7 @@ void lineFollowStep() {
   int crossScoreNow = getCrossLineScore(rawBits);
 
   if (
+    robotMode == MODE_GOING_TO_TABLE &&
     crossScoreNow >= 3 &&
     now >= stopPointIgnoreUntil &&
     (now - lastStopPointDetectedAt >= STOP_POINT_MIN_INTERVAL_MS)
@@ -791,23 +845,51 @@ void lineFollowStep() {
   StopPointEvent stopEvent = checkStopPoint(rawBits);
 
   if (stopEvent == STOP_POINT_DETECTED) {
-    startStopPointWaiting();
+    handleStopPointAction();
     return;
   }
 
   bool hasLine = computeLineError(rawError, bits, rawBits);
 
   if (!hasLine) {
-    robotMode = MODE_LINE_LOST;
-
     if (lineLostTime == 0) {
       lineLostTime = now;
+    }
+
+    /*
+      Khi RETURN:
+      - Đã chạy đủ thời gian tối thiểu.
+      - Đã đi qua điểm dừng 4.
+      - Gặp đoạn ngắt line đủ BASE_GAP_DETECT_MS.
+      => xem như về trạm.
+    */
+    if (robotMode == MODE_RETURNING_TO_BASE) {
+      bool minRunOk = (now - returnStartedAt) >= RETURN_BASE_MIN_RUN_MS;
+      bool afterStop4 = (currentStopPoint == TOTAL_STOP_POINTS);
+
+      if (minRunOk && afterStop4) {
+        if (baseGapLostStartedAt == 0) {
+          baseGapLostStartedAt = now;
+        }
+
+        if (now - baseGapLostStartedAt >= BASE_GAP_DETECT_MS) {
+          arriveAtBase();
+          return;
+        }
+      }
     }
 
     if (now - lineLostTime < LINE_LOST_STOP_MS) {
       searchLine();
     } else {
       stopMotors();
+      lastEvent = "LINE_LOST";
+
+      if (robotMode == MODE_RETURNING_TO_BASE) {
+        robotMode = MODE_ERROR;
+        hasActiveTask = false;
+        lastEvent = "RETURN_LINE_LOST";
+      }
     }
 
     if (DEBUG_MODE) {
@@ -821,8 +903,8 @@ void lineFollowStep() {
     return;
   }
 
-  robotMode = MODE_LINE_FOLLOWING;
   lineLostTime = 0;
+  baseGapLostStartedAt = 0;
 
   float dt = (now - lastTime) / 1000.0;
 
@@ -849,19 +931,32 @@ void lineFollowStep() {
   float correction = Kp * filteredError + Ki * integral + Kd * filteredDerivative;
   correction = constrain(correction, -MAX_CORRECTION, MAX_CORRECTION);
 
-  int dynamicBaseSpeed = BASE_SPEED;
-  float absError = fabs(filteredError);
+  /*
+    Adaptive speed + GOTO Boost:
+    Tăng tốc độ lên 220 trong 700ms đầu khi vừa nhận lệnh GOTO.
+    Sau đó trở về logic tự động giảm tốc khi lệch line.
+  */
+  float absErr = fabs(filteredError);
 
-  if (absError >= 4.0) {
-    dynamicBaseSpeed = BASE_SPEED - 40;
-  } else if (absError >= 2.5) {
-    dynamicBaseSpeed = BASE_SPEED - 30;
+  int adaptiveBase = BASE_SPEED;
+
+  if (robotMode == MODE_GOING_TO_TABLE && (now - gotoStartTime <= GOTO_BOOST_MS)) {
+    adaptiveBase = GOTO_BOOST_SPEED;
+  } else {
+    if (absErr >= 4.5) {
+      adaptiveBase = BASE_SPEED - 30;
+    } else if (absErr >= 3.0) {
+      adaptiveBase = BASE_SPEED - 22;
+    } else if (absErr >= 1.5) {
+      adaptiveBase = BASE_SPEED - 10;
+    }
   }
 
-  dynamicBaseSpeed = constrain(dynamicBaseSpeed, MIN_SPEED, BASE_SPEED);
+  // Nới lỏng chặn trên để cho phép robot xuất ra tốc độ 220 trong giai đoạn tăng tốc
+  adaptiveBase = constrain(adaptiveBase, MIN_SPEED, max(BASE_SPEED, GOTO_BOOST_SPEED));
 
-  int leftSpeed  = dynamicBaseSpeed + correction;
-  int rightSpeed = dynamicBaseSpeed - correction;
+  int leftSpeed  = adaptiveBase + correction;
+  int rightSpeed = adaptiveBase - correction;
 
   bool pivotActive = now < pivotHoldUntil;
 
@@ -869,42 +964,30 @@ void lineFollowStep() {
     pivotTurnLeft();
   } else if ((isExtremeRight(rawBits) || isExtremeRight(bits)) && pivotActive) {
     pivotTurnRight();
-  }
-
-  else if (isHardLeft(rawBits) || isHardLeft(bits) || (now < turnHoldUntil && turnMemory < 0)) {
+  } else if (isHardLeft(rawBits) || isHardLeft(bits) || (now < turnHoldUntil && turnMemory < 0)) {
     leftSpeed  = HARD_TURN_INNER_SPEED;
     rightSpeed = HARD_TURN_OUTER_SPEED;
-    driveForwardCurvePWM(leftSpeed, rightSpeed);
+    driveForwardPWM(leftSpeed, rightSpeed);
   } else if (isHardRight(rawBits) || isHardRight(bits) || (now < turnHoldUntil && turnMemory > 0)) {
     leftSpeed  = HARD_TURN_OUTER_SPEED;
     rightSpeed = HARD_TURN_INNER_SPEED;
-    driveForwardCurvePWM(leftSpeed, rightSpeed);
-  }
-
-  else if (isPrepareLeft(rawBits) || isPrepareLeft(bits)) {
-    // Ép mạnh: hãm nhiều bánh trái, tăng nhiều bánh phải
-    leftSpeed  = BASE_SPEED - 60; // Cũ là 35
-    rightSpeed = BASE_SPEED + 60; // Cũ là 45
-
+    driveForwardPWM(leftSpeed, rightSpeed);
+  } else if (isPrepareLeft(rawBits) || isPrepareLeft(bits)) {
+    leftSpeed  = adaptiveBase - 35;
+    rightSpeed = adaptiveBase + 45;
     leftSpeed  = constrain(leftSpeed,  MIN_SPEED, MAX_SPEED);
     rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
-
-    driveForwardCurvePWM(leftSpeed, rightSpeed);
+    driveForwardPWM(leftSpeed, rightSpeed);
   } else if (isPrepareRight(rawBits) || isPrepareRight(bits)) {
-    leftSpeed  = BASE_SPEED + 60; // Cũ là 45
-    rightSpeed = BASE_SPEED - 60; // Cũ là 35
-
+    leftSpeed  = adaptiveBase + 45;
+    rightSpeed = adaptiveBase - 35;
     leftSpeed  = constrain(leftSpeed,  MIN_SPEED, MAX_SPEED);
     rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
-
-    driveForwardCurvePWM(leftSpeed, rightSpeed);
-  }
-
-  else {
+    driveForwardPWM(leftSpeed, rightSpeed);
+  } else {
     leftSpeed  = constrain(leftSpeed,  MIN_SPEED, MAX_SPEED);
     rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
-
-    driveForwardCurvePWM(leftSpeed, rightSpeed);
+    driveForwardPWM(leftSpeed, rightSpeed);
   }
 
   if (isCenterStable(bits) && now > turnHoldUntil && now > pivotHoldUntil) {
@@ -912,22 +995,317 @@ void lineFollowStep() {
   }
 
   if (DEBUG_MODE) {
-    Serial.print("mode="); Serial.print((int)robotMode);
-    Serial.print(" raw="); printBits(rawBits);
-    Serial.print(" filt="); printBits(bits);
-    Serial.print(" cross="); Serial.print(crossScoreNow);
-    Serial.print(" stable="); Serial.print(stableCounterCross);
-    Serial.print(" stopCount="); Serial.print(stopPointCount);
-    Serial.print(" current="); Serial.print(currentStopPoint);
-    Serial.print(" event="); Serial.print((int)lastStopPointEvent);
-    Serial.print(" err="); Serial.print(rawError, 2);
-    Serial.print(" filtErr="); Serial.print(filteredError, 2);
-    Serial.print(" corr="); Serial.print(correction, 2);
-    Serial.print(" L="); Serial.print(leftSpeed);
-    Serial.print(" R="); Serial.print(rightSpeed);
-    Serial.print(" side="); Serial.print(lastSeenSide);
-    Serial.print(" turnMem="); Serial.print(turnMemory);
-    Serial.print(" pivot="); Serial.println(pivotActive ? 1 : 0);
+    static unsigned long lastDebugPrint = 0;
+
+    if (now - lastDebugPrint > 150) {
+      lastDebugPrint = now;
+
+      Serial.print("[RUN] raw=");
+      printBits(rawBits);
+      Serial.print(" filt=");
+      printBits(bits);
+      Serial.print(" crossScore=");
+      Serial.print(getCrossLineScore(rawBits));
+      Serial.print(" crossStable=");
+      Serial.print(stableCounterCross);
+      Serial.print(" current=");
+      Serial.print(currentStopPoint);
+      Serial.print(" target=");
+      Serial.print(targetStopPoint);
+      Serial.print(" err=");
+      Serial.print(filteredError, 2);
+      Serial.print(" corr=");
+      Serial.print(correction, 2);
+      Serial.print(" base=");
+      Serial.print(adaptiveBase);
+      Serial.print(" L=");
+      Serial.print(leftSpeed);
+      Serial.print(" R=");
+      Serial.println(rightSpeed);
+    }
+  }
+}
+
+// =====================================================
+// RETURN / BASE FUNCTIONS
+// =====================================================
+void startReturnToBase() {
+  if (robotMode != MODE_WAITING_AT_TABLE && robotMode != MODE_STOPPED) {
+    lastEvent = "RETURN_REJECTED_NOT_AT_TABLE";
+    return;
+  }
+
+  robotMode = MODE_RETURNING_TO_BASE;
+  hasActiveTask = true;
+  lastEvent = "RETURN_TO_BASE";
+
+  returnStartedAt = millis();
+  baseGapLostStartedAt = 0;
+
+  resetPIDAfterStopPoint();
+
+  stopPointBypassUntil = millis() + STOP_POINT_BYPASS_MS;
+  stopPointIgnoreUntil = millis() + STOP_POINT_IGNORE_MS;
+
+  if (DEBUG_MODE) {
+    Serial.println("[TASK] RETURN_TO_BASE");
+  }
+}
+
+void arriveAtBase() {
+  stopMotors();
+
+  robotMode = MODE_IDLE_AT_BASE;
+  hasActiveTask = false;
+
+  targetStopPoint = 0;
+  stopPointCount = 0;
+  currentStopPoint = 0;
+
+  stableCounterCross = 0;
+  baseGapLostStartedAt = 0;
+  lastStopPointDetectedAt = 0;
+
+  resetPIDAfterStopPoint();
+
+  lastEvent = "ARRIVED_BASE";
+
+  if (DEBUG_MODE) {
+    Serial.println("[BASE] ARRIVED_BASE");
+  }
+}
+
+// =====================================================
+// ROBOT MODE HELPERS
+// =====================================================
+String modeToString(RobotMode mode) {
+  switch (mode) {
+    case MODE_IDLE_AT_BASE:
+      return "IDLE_AT_BASE";
+
+    case MODE_GOING_TO_TABLE:
+      return "GOING_TO_TABLE";
+
+    case MODE_WAITING_AT_TABLE:
+      return "WAITING_AT_TABLE";
+
+    case MODE_RETURNING_TO_BASE:
+      return "RETURNING_TO_BASE";
+
+    case MODE_STOPPED:
+      return "STOPPED";
+
+    case MODE_ERROR:
+      return "ERROR";
+
+    default:
+      return "UNKNOWN";
+  }
+}
+
+void resetNavigationForNewTask() {
+  stableCounterCross = 0;
+  stopPointCount = 0;
+  currentStopPoint = 0;
+
+  stopPointBypassUntil = 0;
+  stopPointIgnoreUntil = millis() + START_IGNORE_MS;
+
+  lastStopPointDetectedAt = 0;
+  lastStopPointEvent = STOP_POINT_NONE;
+
+  baseGapLostStartedAt = 0;
+
+  resetPIDAfterStopPoint();
+}
+
+void startGotoTable(int tableId) {
+  targetStopPoint = tableId;
+  hasActiveTask = true;
+  robotMode = MODE_GOING_TO_TABLE;
+  lastEvent = "GOTO:" + String(tableId);
+
+  resetNavigationForNewTask();
+  
+  // Lưu thời điểm nhận lệnh GOTO để đếm 700ms tăng tốc
+  gotoStartTime = millis();
+
+  if (DEBUG_MODE) {
+    Serial.print("[TASK] Start GOTO:");
+    Serial.println(tableId);
+  }
+}
+
+void emergencyStopRobot() {
+  stopMotors();
+
+  hasActiveTask = false;
+  robotMode = MODE_STOPPED;
+  lastEvent = "STOP";
+}
+
+// =====================================================
+// TCP COMMAND HANDLER
+// =====================================================
+String buildStatusString() {
+  String s = "STATUS:";
+  s += modeToString(robotMode);
+  s += ",target=" + String(targetStopPoint);
+  s += ",current=" + String(currentStopPoint);
+  s += ",count=" + String(stopPointCount);
+  s += ",active=" + String(hasActiveTask ? 1 : 0);
+  s += ",crossStable=" + String(stableCounterCross);
+  s += ",last=" + lastEvent;
+  s += ",ip=" + WiFi.localIP().toString();
+
+  return s;
+}
+
+String processCommand(String cmd) {
+  cmd.trim();
+  cmd.toUpperCase();
+
+  lastCommand = cmd;
+
+  if (cmd.length() == 0) {
+    return "ERR:EMPTY_COMMAND";
+  }
+
+  if (cmd == "PING") {
+    return "PONG";
+  }
+
+  if (cmd == "STATUS") {
+    return buildStatusString();
+  }
+
+  if (cmd == "STOP") {
+    emergencyStopRobot();
+    return "OK:STOP";
+  }
+
+  if (cmd == "RETURN" || cmd == "CONTINUE") {
+    if (robotMode != MODE_WAITING_AT_TABLE && robotMode != MODE_STOPPED) {
+      return "ERR:RETURN_REQUIRES_WAITING_AT_TABLE";
+    }
+
+    startReturnToBase();
+    return "OK:RETURN";
+  }
+
+  if (cmd.startsWith("GOTO:")) {
+    String arg = cmd.substring(5);
+    int tableId = arg.toInt();
+
+    if (tableId < 1 || tableId > 4) {
+      return "ERR:INVALID_TABLE";
+    }
+
+    if (robotMode == MODE_GOING_TO_TABLE || robotMode == MODE_RETURNING_TO_BASE) {
+      return "ERR:ROBOT_BUSY";
+    }
+
+    startGotoTable(tableId);
+    return "OK:GOTO:" + String(tableId);
+  }
+
+  return "ERR:UNKNOWN_COMMAND";
+}
+
+void handleTcpClient() {
+  WiFiClient client = server.available();
+
+  if (!client) {
+    return;
+  }
+
+  client.setTimeout(300);
+  client.setNoDelay(true);
+
+  String cmd = "";
+  unsigned long startMs = millis();
+
+  while (client.connected() && (millis() - startMs < 300)) {
+    while (client.available()) {
+      char c = (char)client.read();
+
+      if (c == '\r') {
+        continue;
+      }
+
+      if (c == '\n') {
+        startMs = 0;
+        break;
+      }
+
+      cmd += c;
+
+      if (cmd.length() >= 64) {
+        startMs = 0;
+        break;
+      }
+    }
+
+    if (startMs == 0) {
+      break;
+    }
+
+    if (cmd.length() > 0 && !client.available()) {
+      delay(2);
+
+      if (!client.available()) {
+        break;
+      }
+    }
+
+    delay(1);
+  }
+
+  String response = processCommand(cmd);
+
+  client.print(response);
+  client.print("\n");
+  client.flush();
+
+  delay(5);
+
+  if (DEBUG_MODE) {
+    Serial.print("[TCP] cmd=");
+    Serial.print(cmd);
+    Serial.print(" response=");
+    Serial.println(response);
+  }
+
+  client.stop();
+}
+
+// =====================================================
+// WIFI SETUP
+// =====================================================
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  Serial.print("[WIFI] Connecting to ");
+  Serial.println(WIFI_SSID);
+
+  unsigned long startAttempt = millis();
+
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[WIFI] Connected. IP=");
+    Serial.println(WiFi.localIP());
+    lastEvent = "WIFI_CONNECTED";
+  } else {
+    Serial.println("[WIFI] Failed to connect.");
+    lastEvent = "WIFI_FAILED";
   }
 }
 
@@ -958,32 +1336,44 @@ void setup() {
   stopMotors();
 
   resetPIDAfterStopPoint();
+  resetNavigationForNewTask();
 
-  stableCounterCross = 0;
-  stopPointCount = 0;
-  currentStopPoint = 0;
+  robotMode = MODE_IDLE_AT_BASE;
+  hasActiveTask = false;
+  targetStopPoint = 0;
+  lastEvent = "SYSTEM_READY";
 
-  stopPointBypassUntil = 0;
-  stopPointWaitUntil = 0;
-  lastStopPointDetectedAt = 0;
+  connectWiFi();
+  server.begin();
 
-  lastStopPointEvent = STOP_POINT_NONE;
-  robotMode = MODE_LINE_FOLLOWING;
+  Serial.print("[TCP] Server started on port ");
+  Serial.println(TCP_PORT);
 
-  // Bỏ qua vạch start trong vài giây đầu.
-  stopPointIgnoreUntil = millis() + START_IGNORE_MS;
-
-  if (DEBUG_MODE) {
-    Serial.println("[LIBBOT] Line Following + 4 Stop Points Test Ready");
-  }
-
-  delay(1000);
+  Serial.println("[LIBBOT] ESP32 V6 improved cross-score stop-point logic ready.");
 }
 
 // =====================================================
 // LOOP
 // =====================================================
 void loop() {
-  lineFollowStep();
-  delay(1);
+  handleTcpClient();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    stopMotors();
+
+    robotMode = MODE_ERROR;
+    hasActiveTask = false;
+    lastEvent = "WIFI_DISCONNECTED";
+
+    delay(200);
+    return;
+  }
+
+  if (robotMode == MODE_GOING_TO_TABLE || robotMode == MODE_RETURNING_TO_BASE) {
+    lineFollowStep();
+  } else {
+    stopMotors();
+  }
+
+  delay(5);
 }
