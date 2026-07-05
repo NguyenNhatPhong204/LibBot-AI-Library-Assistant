@@ -373,7 +373,9 @@ Stable counter tăng +2 (score≥4) hoặc +1 (score=3) và giảm -1 nếu khô
 **Năm:** 2026
 
 ---
+## Link youtube video demo
+https://www.youtube.com/watch?v=GvDqSkM8cEI
 
-## 📄 License
+## License
 
 Dự án này được thực hiện phục vụ mục đích học thuật trong khuôn khổ Đồ án Tốt nghiệp tại HCM-UTE.
